@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",                // Set target to ES2020 or higher
+    "module": "commonjs",             // Use CommonJS module resolution
+    "moduleResolution": "node",       // Set module resolution to Node
+    "strict": true,                   // Enable strict type checking
+    "esModuleInterop": true,          // Allow default imports from CommonJS modules
+    "skipLibCheck": true,             // Skip type checking for declaration files
+    "outDir": "./dist",               // Output directory for compiled files
+    "resolveJsonModule": true         // Support importing JSON files
+  },
+  "include": ["./**/*.ts"],            // Include all TypeScript files
+  "exclude": ["node_modules"]          // Exclude node_modules
+}

@@ -1,0 +1,4 @@
+requests
+torch
+websockets
+lightning-whisper-mlx

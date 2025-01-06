@@ -10,13 +10,13 @@ def play_mp3_to_virtual_mic(mp3_file_path, device_index, loop=True):
     # audio = audio.set_frame_rate(48000).set_channels(2).set_sample_width(2)  # Ensure 16-bit stereo, 44100 Hz
 
     audio = audio - 10  # Reduce volume by 5 dB
-    
+
     # Get audio properties
     audio_data = audio.raw_data  # Access the raw audio data
     sample_width = audio.sample_width
     channels = audio.channels
     frame_rate = audio.frame_rate
-    
+
     p = pyaudio.PyAudio()
 
     stream = p.open(

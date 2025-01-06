@@ -5,11 +5,10 @@ import random
 import string
 from typing import Optional, Dict, Any
 
-from janus_client import JanusSession, VideoRoomPlugin, JanusError
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer
-from aiortc.media.stream import MediaStreamTrack
-from aiortc.mediastreams import AudioFrame
-from aiortc.contrib.media import MediaBlackhole  # or your own sink
+from janus_client import JanusSession, JanusVideoRoomPlugin
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, MediaStreamTrack
+from aiortc.contrib.media import MediaBlackhole
+from av import AudioFrame
 
 logger = logging.getLogger(__name__)
 
@@ -41,19 +40,20 @@ class PCMDataAudioStreamTrack(MediaStreamTrack):
         frame = await self._frames.get()
         return frame
 
-    def push_pcm_data(self, samples: bytes, timestamp: float):
+    def push_pcm_data(self, samples: int):
         """
         Accept PCM data from external code.
         - `samples` should be raw PCM bytes (16-bit signed).
         - `timestamp` in seconds or some monotonic reference.
         """
         # Create an AudioFrame
-        frame = AudioFrame.from_raw_audio(
+        frame = AudioFrame(
             samples,
-            layout="mono" if self._channels == 1 else "stereo",
-            sample_rate=self._sample_rate,
-            timestamp=timestamp,
+            layout="mono" if self._channels == 1 else "stereo"
         )
+
+        frame.sample_rate = self._sample_rate
+
         # Put it in the queue to be served by recv()
         self._frames.put_nowait(frame)
 
@@ -92,30 +92,30 @@ class JanusAudioSource:
         """
         return self._track
 
-    def pushPcmData(
-        self, samples: Int16Array, sampleRate: int, channels: int = 1
-    ):
-        """
-        In TypeScript, you call this.source.onData(...).
-        Here, we call `push_pcm_data(...)` on our custom track.
-        
-        We'll assume `samples` is an Int16Array-like object. In Python,
-        you might actually have a list or a numpy array. We'll convert it to bytes.
-        """
-        if channels != self._track.channels or sampleRate != self._track.sample_rate:
-            logger.warning(
-                "Pushing PCM data with different rate or channel count than the original track!"
-            )
-
-        # Convert Int16 array -> raw bytes in little-endian
-        # e.g. if you already have a Python 'bytes' object, skip this step
-        raw_bytes = samples.tobytes()  # works if samples is a numpy array or array module
-
-        timestamp = time.time()  # or any monotonic clock
-        self._track.push_pcm_data(
-            samples=raw_bytes,
-            timestamp=timestamp,
-        )
+#    def pushPcmData(
+#        self, samples: Int16Array, sampleRate: int, channels: int = 1
+#    ):
+#        """
+#        In TypeScript, you call this.source.onData(...).
+#        Here, we call `push_pcm_data(...)` on our custom track.
+#        
+#        We'll assume `samples` is an Int16Array-like object. In Python,
+#        you might actually have a list or a numpy array. We'll convert it to bytes.
+#        """
+#        if channels != self._track.channels or sampleRate != self._track.sample_rate:
+#            logger.warning(
+#                "Pushing PCM data with different rate or channel count than the original track!"
+#            )
+#
+#        # Convert Int16 array -> raw bytes in little-endian
+#        # e.g. if you already have a Python 'bytes' object, skip this step
+#        raw_bytes = samples.tobytes()  # works if samples is a numpy array or array module
+#
+#        timestamp = time.time()  # or any monotonic clock
+#        self._track.push_pcm_data(
+#            samples=raw_bytes,
+#            timestamp=timestamp,
+#        )
 
 
 class JanusAudioSink:
@@ -129,15 +129,13 @@ class JanusAudioSink:
 
     def __init__(
         self,
-        track: MediaStreamTrack,
-        on_audio_data: Optional[Callable[[dict], None]] = None,
+        track: MediaStreamTrack
     ):
         if track.kind != "audio":
             raise ValueError("JanusAudioSink must be constructed with an audio track")
 
         self.track = track
         self.active = True
-        self._on_audio_data = on_audio_data
         self._task = asyncio.create_task(self._run())
 
     async def _run(self):
@@ -171,8 +169,8 @@ class JanusAudioSink:
                 "channelCount": channel_count,
             }
 
-            if self._on_audio_data:
-                self._on_audio_data(frame_dict)
+#            if self._on_audio_data:
+#                self._on_audio_data(frame_dict)
 
     def stop(self):
         """
@@ -380,23 +378,23 @@ class JanusClient:
             await self.pc_publisher.close()
             self.pc_publisher = None
 
-        # Close subscriber PCs
-        for user_id, pc in self.subscribers.items():
-            logger.info(f"Closing subscriber PC for user={user_id}")
-            await pc.close()
-        self.subscribers.clear()
-
-        # Detach plugin and destroy session
-        if self.video_room:
-            try:
-                await self.video_room.detach()
-            except JanusError as e:
-                logger.error(f"Error detaching video_room plugin: {e}")
-            self.video_room = None
-
-        if self.session:
-            await self.session.destroy()
-            self.session = None
+#        # Close subscriber PCs
+#        for user_id, pc in self.subscribers.items():
+#            logger.info(f"Closing subscriber PC for user={user_id}")
+#            await pc.close()
+#        self.subscribers.clear()
+#
+#        # Detach plugin and destroy session
+#        if self.video_room:
+#            try:
+#                await self.video_room.detach()
+#            except JanusError as e:
+#                logger.error(f"Error detaching video_room plugin: {e}")
+#            self.video_room = None
+#
+#        if self.session:
+#            await self.session.destroy()
+#            self.session = None
 
     async def create_room(self):
         if self._room_created:
@@ -416,7 +414,7 @@ class JanusClient:
             )
             logger.info(f"Room '{self.config.room_id}' created successfully")
             self._room_created = True
-        except JanusError as err:
+        except Exception as err:
             # Possibly the room already exists, so handle that gracefully
             if "already exists" in str(err):
                 logger.warning(f"Room {self.config.room_id} already exists.")
@@ -526,7 +524,7 @@ class JanusClient:
         try:
             await self.video_room.destroy_room(room_id=self.config.room_id)
             logger.info("Room destroyed")
-        except JanusError as e:
+        except Exception as e:
             logger.error(f"destroyRoom failed => {e}")
 
     async def leave_room(self):
@@ -538,7 +536,7 @@ class JanusClient:
         try:
             await self.video_room.leave()
             logger.info("Left room successfully")
-        except JanusError as e:
+        except Exception as e:
             logger.error(f"leaveRoom => error: {e}")
 
     @staticmethod

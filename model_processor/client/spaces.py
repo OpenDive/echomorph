@@ -1,16 +1,12 @@
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any, Set
+import time
+import aiohttp
+from typing import Optional, Dict, Any, Set, List
 
-# Placeholders for your actual modules:
-# from your_module.chat_client import ChatClient
-# from your_module.janus_client import JanusClient
-# from your_module.scraper import Scraper
-# from your_module.utils import get_turn_servers, create_broadcast, publish_broadcast, authorize_token, get_region
 from chat_client import ChatClient
-from janus_client import JanusClient
-from utils import get_turn_servers, create_broadcast, publish_broadcast, authorize_token, get_region
+from custom_janus_client import JanusClient
 from authenticator import TwitterAuth, get_periscope_cookie
 
 logger = logging.getLogger(__name__)
@@ -37,53 +33,61 @@ class EventEmitter:
 # ----- Example type hints, similar to your TypeScript interfaces -----
 
 class AudioData:
-    bitsPerSample: int
-    sampleRate: int
-    channelCount: int
-    numberOfFrames: int
-    samples: bytes  # or memoryview, or an array
+    def __init__(self, bitsPerSample: int, sampleRate: int, channelCount: int, numberOfFrames: int, samples: bytes):
+        self.bitsPerSample = bitsPerSample
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+        self.numberOfFrames = numberOfFrames
+        self.samples = samples
 
 
 class AudioDataWithUser(AudioData):
-    userId: str
+    def __init__(self, bitsPerSample: int, sampleRate: int, channelCount: int, numberOfFrames: int, samples: bytes, userId: str):
+        super().__init__(bitsPerSample, sampleRate, channelCount, numberOfFrames, samples)
+        self.userId = userId
 
 
 class SpeakerRequest:
-    userId: str
-    username: str
-    displayName: str
-    sessionUUID: str
+    def __init__(self, userId: str, username: str, displayName: str, sessionUUID: str):
+        self.userId = userId
+        self.username = username
+        self.displayName = displayName
+        self.sessionUUID = sessionUUID
 
 
 class OccupancyUpdate:
-    occupancy: int
-    totalParticipants: int
+    def __init__(self, occupancy: int, totalParticipants: int):
+        self.occupancy = occupancy
+        self.totalParticipants = totalParticipants
 
 
 class SpaceConfig:
-    mode: str  # 'BROADCAST' | 'LISTEN' | 'INTERACTIVE'
-    title: Optional[str] = None
-    description: Optional[str] = None
-    languages: Optional[list] = None
+    def __init__(self, mode: str, title: Optional[str] = None, description: Optional[str] = None, languages: Optional[List[str]] = None):
+        self.mode = mode
+        self.title = title
+        self.description = description
+        self.languages = languages
 
 
 class BroadcastCreated:
-    room_id: str
-    credential: str
-    stream_name: str
-    webrtc_gw_url: str
-    broadcast: Dict[str, Any]
-    access_token: str
-    endpoint: str
-    share_url: str
-    stream_url: str
+    def __init__(self, room_id: str, credential: str, stream_name: str, webrtc_gw_url: str, broadcast: Dict[str, Any], access_token: str, endpoint: str, share_url: str, stream_url: str):
+        self.room_id = room_id
+        self.credential = credential
+        self.stream_name = stream_name
+        self.webrtc_gw_url = webrtc_gw_url
+        self.broadcast = broadcast
+        self.access_token = access_token
+        self.endpoint = endpoint
+        self.share_url = share_url
+        self.stream_url = stream_url
 
 
 class TurnServersInfo:
-    ttl: str
-    username: str
-    password: str
-    uris: list
+    def __init__(self, ttl: str, username: str, password: str, uris: List[str]):
+        self.ttl = ttl
+        self.username = username
+        self.password = password
+        self.uris = uris
 
 
 class Plugin:
@@ -107,6 +111,174 @@ class PluginRegistration:
     def __init__(self, plugin: Plugin, config: Optional[Dict[str, Any]] = None):
         self.plugin = plugin
         self.config = config
+        
+        
+async def authorize_token(cookie: str) -> str:
+    """
+    Python equivalent of authorizeToken(cookie: string): Promise<string>.
+    Calls https://proxsee.pscp.tv/api/v2/authorizeToken and returns authorization_token.
+    """
+    headers = {
+        "X-Periscope-User-Agent": "Twitter/m5",
+        "Content-Type": "application/json",
+        "X-Idempotence": str(int(time.time() * 1000)),  # approximate to Date.now()
+        "Referer": "https://x.com/",
+        "X-Attempt": "1",
+    }
+
+    url = "https://proxsee.pscp.tv/api/v2/authorizeToken"
+    body = {
+        "service": "guest",
+        "cookie": cookie,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Failed to authorize token => {resp.status}")
+            data = await resp.json()
+            authorization_token = data.get("authorization_token")
+            if not authorization_token:
+                raise RuntimeError(
+                    "authorize_token: Missing authorization_token in response"
+                )
+            return authorization_token
+
+
+async def publish_broadcast(
+    title: str,
+    broadcast: Dict[str, Any],  # or BroadcastCreated
+    cookie: str,
+    janus_session_id: Optional[int] = None,
+    janus_handle_id: Optional[int] = None,
+    janus_publisher_id: Optional[int] = None,
+):
+    """
+    Python equivalent of publishBroadcast(...).
+    Calls https://proxsee.pscp.tv/api/v2/publishBroadcast to finalize the broadcast config.
+    """
+    headers = {
+        "X-Periscope-User-Agent": "Twitter/m5",
+        "Content-Type": "application/json",
+        "Referer": "https://x.com/",
+        "X-Idempotence": str(int(time.time() * 1000)),
+        "X-Attempt": "1",
+    }
+
+    url = "https://proxsee.pscp.tv/api/v2/publishBroadcast"
+    body = {
+        "accept_guests": True,
+        "broadcast_id": broadcast["room_id"],
+        "webrtc_handle_id": janus_handle_id,
+        "webrtc_session_id": janus_session_id,
+        "janus_publisher_id": janus_publisher_id,
+        "janus_room_id": broadcast["room_id"],
+        "cookie": cookie,
+        "status": title,
+        "conversation_controls": 0,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"Failed to publish broadcast => {resp.status}"
+                )
+            # The original code doesn't check for JSON; it just does a POST.
+
+
+async def get_turn_servers(cookie: str) -> Dict[str, Any]:  # or TurnServersInfo
+    """
+    Python equivalent of getTurnServers(cookie: string).
+    POSTs to https://proxsee.pscp.tv/api/v2/turnServers and returns the JSON response.
+    """
+    headers = {
+        "X-Periscope-User-Agent": "Twitter/m5",
+        "Content-Type": "application/json",
+        "Referer": "https://x.com/",
+        "X-Idempotence": str(int(time.time() * 1000)),
+        "X-Attempt": "1",
+    }
+
+    url = "https://proxsee.pscp.tv/api/v2/turnServers"
+    body = {"cookie": cookie}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"Failed to get turn servers => {resp.status}"
+                )
+            return await resp.json()
+
+
+async def get_region() -> str:
+    """
+    Python equivalent of getRegion().
+    POSTs to https://signer.pscp.tv/region with an empty JSON body.
+    Returns the 'region' field from the response.
+    """
+    url = "https://signer.pscp.tv/region"
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": "https://x.com",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json={}) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Failed to get region => {resp.status}")
+            data = await resp.json()
+            region = data.get("region")
+            if not region:
+                raise RuntimeError("No 'region' in response data")
+            return region
+
+
+async def create_broadcast(
+    description: Optional[str],
+    languages: Optional[list],
+    cookie: str,
+    region: str
+) -> Dict[str, Any]:  # or BroadcastCreated
+    """
+    Python equivalent of createBroadcast(...).
+    Creates a new broadcast via https://proxsee.pscp.tv/api/v2/createBroadcast
+    and returns the JSON response.
+    """
+    headers = {
+        "X-Periscope-User-Agent": "Twitter/m5",
+        "Content-Type": "application/json",
+        "X-Idempotence": str(int(time.time() * 1000)),
+        "Referer": "https://x.com/",
+        "X-Attempt": "1",
+    }
+
+    url = "https://proxsee.pscp.tv/api/v2/createBroadcast"
+    body = {
+        "app_component": "audio-room",
+        "content_type": "visual_audio",
+        "cookie": cookie,
+        "conversation_controls": 0,
+        "description": description or "",
+        "height": 1080,
+        "is_360": False,
+        "is_space_available_for_replay": False,
+        "is_webrtc": True,
+        "languages": languages if languages is not None else [],
+        "region": region,
+        "width": 1920,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"Failed to create broadcast => {resp.status} {text}"
+                )
+            data = await resp.json()
+            return data
 
 
 # ----- Python version of the Space class -----
@@ -119,10 +291,10 @@ class Space(EventEmitter):
     3) Approve speakers, push audio, etc.
     """
 
-    def __init__(self, bearer_token: str, guest_token: str):
+    def __init__(self, twitter_auth: TwitterAuth):
         super().__init__()
-        
-        self.auth = TwitterAuth(bearer_token=bearer_token, guest_token=guest_token)
+
+        self.auth = twitter_auth
 
         self.janus_client: Optional["JanusClient"] = None
         self.chat_client: Optional["ChatClient"] = None
@@ -154,7 +326,7 @@ class Space(EventEmitter):
         logger.info("[Space] Initializing...")
 
         # 1) get Periscope cookie from the scraper
-        cookie = await self.get_periscope_cookie(self.auth)
+        cookie = await get_periscope_cookie(self.auth)
 
         # 2) get region
         region = await get_region()

@@ -1,44 +1,12 @@
-import asyncio
+import os
 import uuid
 import json
 import time
+import httpx
 from typing import Any, Dict
+from fake_useragent import FakeUserAgent
 
-import aiohttp
-from aiohttp import ClientResponse, CookieJar
-
-
-class TwitterAuth:
-    """
-    Stores authentication info needed for requests:
-      - bearer_token
-      - guest_token
-      - cookie_jar (for storing or updating cookies)
-    """
-    def __init__(self, bearer_token: str, guest_token: str):
-        self.bearer_token = bearer_token
-        self.guest_token = guest_token
-        # We'll keep a cookie jar for all requests:
-        self.cookie_jar = aiohttp.CookieJar()
-
-    async def fetch(self, url: str, **kwargs) -> aiohttp.ClientResponse:
-        """
-        In TypeScript, this was auth.fetch(...).
-        We'll create an aiohttp session on the fly here.
-        For more complex scenarios, you might keep a persistent session object.
-        """
-        async with aiohttp.ClientSession(cookie_jar=self.cookie_jar) as session:
-            return await session.request(url=url, **kwargs)
-
-    def get_cookie_string(self, domain_url: str) -> str:
-        """
-        Returns a 'Cookie' header string from the cookie jar for a given domain (like onboardingTaskUrl).
-        In TypeScript: `auth.cookieJar().getCookieString(onboardingTaskUrl)`
-        """
-        cookies = self.cookie_jar.filter_cookies(domain_url)
-        cookie_list = [f"{k}={v.value}" for k, v in cookies.items()]
-        return "; ".join(cookie_list)
-
+from tweeterpy import TweeterPy
 
 def generate_random_id() -> str:
     """
@@ -47,89 +15,71 @@ def generate_random_id() -> str:
     return str(uuid.uuid4())
 
 
-async def update_cookie_jar(cookie_jar: aiohttp.CookieJar, response: aiohttp.ClientResponse):
-    """
-    If needed, manually update cookies from response. 
-    By default, aiohttp updates the jar automatically if using the same session.
-    """
-    pass
-    # If you want to manually parse 'Set-Cookie', do so here.
-
-
-async def fetch_authenticate_periscope(auth: TwitterAuth) -> str:
+# ---------------------------------------------------------------------------
+# Existing Periscope authentication flow
+# ---------------------------------------------------------------------------
+async def fetch_authenticate_periscope(scraper: TweeterPy) -> str:
     """
     Equivalent to TypeScript's 'fetchAuthenticatePeriscope(auth)'.
     Returns a Periscope JWT on success.
     """
-    query_id = "r7VUmxbfqNkx7uwjgONSNw"
-    operation_name = "AuthenticatePeriscope"
-    variables = {}
-    features = {}
-
-    # Encode for the URL
-    from aiohttp.helpers import quote
-    variables_encoded = quote(json.dumps(variables), safe='')
-    features_encoded = quote(json.dumps(features), safe='')
-
-    url = (
-        f"https://x.com/i/api/graphql/{query_id}/{operation_name}"
-        f"?variables={variables_encoded}&features={features_encoded}"
-    )
-
-    onboarding_task_url = "https://api.twitter.com/1.1/onboarding/task.json"
-
-    # Need 'ct0' cookie for X-CSRF
-    cookies = auth.cookie_jar.filter_cookies(onboarding_task_url)
-    x_csrf_token = cookies.get("ct0")
-    if x_csrf_token is None:
-        raise RuntimeError("CSRF Token (ct0) not found in cookies.")
-
+    client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
+    auth_periscope_url = "https://x.com/i/api/graphql/r7VUmxbfqNkx7uwjgONSNw/AuthenticatePeriscope"
     client_transaction_id = generate_random_id()
+
+    gt = scraper.request_client.session.cookies.get("gt")
+    csrf = scraper.request_client.session.cookies.get("ct0")
+#    twitter_cookies = scraper.request_client.session.cookies.text
+    print(f"DEBUG::: COOKIES LENGTH - {len(scraper.request_client.session.cookies)}")
+    print(f"DEBUG::: GUEST TOKEN - {gt}")
+    print(f"DEBUG::: CSRF TOKEN - {csrf}")
+    print(f"DEBUG::: FORMATTED COOKIE - {format_cookie(scraper.request_client.session.cookies.items())}")
+#    print(f"DEBUG::: TWITTER COOKIES - {twitter_cookies}")
+    
+#    for key, value in scraper.request_client.session.cookies.items():
+#        print(f"DEBUG::: TWEET COOKIES KEY - {key}")
+#        print(f"DEBUG::: TWEET COOKIES VALUE - {value}")
+
+#    ua = FakeUserAgent(browsers="chrome", platforms="pc")
+#    user_agent = ua.random
 
     headers = {
         "Accept": "*/*",
-        "Authorization": f"Bearer {auth.bearer_token}",
+        "Authorization": f"Bearer AAAAAAAAAAAAAAAAAAAAAMffxwEAAAAA8r5O5TaBb9pn5snKxxEMXRPNUOA%3DOc7hn0ifwYhqatrNNUM42",
         "Content-Type": "application/json",
-        "Cookie": auth.get_cookie_string(onboarding_task_url),
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "x-guest-token": auth.guest_token,
-        "x-twitter-auth-type": "OAuth2Session",
-        "x-twitter-active-user": "yes",
-        "x-csrf-token": x_csrf_token.value,
-        "x-client-transaction-id": client_transaction_id,
+        "Cookie": format_cookie(scraper.request_client.session.cookies.items()),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "X-Guest-Token": gt,
+        "X-Twitter-Auth-Type": "OAuth2Session",
+        "X-Twitter-Active-User": "yes",
+#        "Sec-Fetch-Dest": "empty",
+#        "Sec-Fetch-Mode": "cors",
+        "X-Csrf-Token": csrf,
+        "X-Client-Transaction-ID": client_transaction_id,
         "sec-ch-ua-platform": "\"Windows\"",
         "sec-ch-ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
-        "x-twitter-client-language": "en",
+        "X-Twitter-Client-Language": "en",
         "sec-ch-ua-mobile": "?0",
-        "Referer": "https://x.com/i/spaces/start",
+        "Referer": "https://x.com/i/spaces/start"
     }
 
-    response = await auth.fetch(url, method="GET", headers=headers)
-    await update_cookie_jar(auth.cookie_jar, response)
+    response = await client.get(auth_periscope_url, headers=headers)
+    response.raise_for_status()
 
-    if response.status != 200:
-        error_text = await response.text()
-        raise RuntimeError(f"Error {response.status}: {error_text}")
-
-    data = await response.json()
-    if "errors" in data and len(data["errors"]) > 0:
-        raise RuntimeError(f"API Errors: {json.dumps(data['errors'])}")
-    if not data.get("data") or not data["data"].get("authenticate_periscope"):
-        raise RuntimeError("Periscope authentication failed, no data returned.")
-
-    return data["data"]["authenticate_periscope"]
+    data = response.json()
+    return data["token"]
 
 
-async def fetch_login_twitter_token(jwt: str, auth: TwitterAuth) -> Dict[str, Any]:
+async def fetch_login_twitter_token(jwt: str, scraper: TweeterPy) -> Dict[str, Any]:
     """
     Logs in to Twitter via Proxsee using the Periscope JWT, returns { cookie, user }.
     """
+    client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
     url = "https://proxsee.pscp.tv/api/v2/loginTwitterToken"
     idempotence_key = generate_random_id()
+    
+    ua = FakeUserAgent(browsers="chrome", platforms="pc")
+    user_agent = ua.random
 
     payload = {
         "jwt": jwt,
@@ -139,101 +89,53 @@ async def fetch_login_twitter_token(jwt: str, auth: TwitterAuth) -> Dict[str, An
 
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://x.com/",
-        "sec-ch-ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
-        "sec-ch-ua-platform": "\"Windows\"",
-        "sec-ch-ua-mobile": "?0",
-        "X-Periscope-User-Agent": "Twitter/m5",
+        "User-Agent": user_agent,
+        "Referer": "https://x.com/home",
         "X-Idempotence": idempotence_key,
         "X-Attempt": "1",
+        "X-Csrf-Token": scraper.request_client.session.cookies.get("ct0"),
     }
 
-    response = await auth.fetch(url, method="POST", headers=headers, data=json.dumps(payload))
-    await update_cookie_jar(auth.cookie_jar, response)
+    response = await client.post(url, headers=headers, json=payload)
+    response.raise_for_status()
 
-    if response.status != 200:
-        error_text = await response.text()
-        raise RuntimeError(f"Error {response.status}: {error_text}")
-
-    data = await response.json()
-    if "cookie" not in data or "user" not in data:
-        raise RuntimeError("Twitter authentication failed, missing data.")
-
-    return data
+    return response.json()
 
 
-async def get_periscope_cookie(auth: TwitterAuth) -> str:
+async def get_periscope_cookie(scraper: TweeterPy) -> str:
     """
     1) authenticatePeriscope -> get JWT
     2) loginTwitterToken -> get { cookie, user }
     3) return the cookie
     """
-    jwt_token = await fetch_authenticate_periscope(auth)
-    login_response = await fetch_login_twitter_token(jwt_token, auth)
+    jwt_token = await fetch_authenticate_periscope(scraper)
+    login_response = await fetch_login_twitter_token(jwt_token)
     return login_response["cookie"]
 
+def format_cookie(cookies: Dict[str, str]) -> str:
+    allowed_headers = ["guest_id_marketing", "guest_id_ads", "personalization_id", "guest_id", "kdt", "twid", "ct0", "auth_token", "att"]
+    percentage_filter = ["guest_id_marketing", "guest_id_ads", "guest_id"]
+    p_id = "personalization_id"
+    twid = "twid"
+    second_p_id = False
+    
+    return_value = ""
+    for key, value in cookies:
+        if key in twid:
+            fmt_twid = f"{value}".replace("%3D", "=")
+            return_value += f"{key}=\"{fmt_twid}\"; "
+        elif key in allowed_headers:
+            if key in percentage_filter:
+                if "%" in value:
+                    return_value += f"{key}={value}; "
+            elif key in p_id:
+                if second_p_id:
+                    return_value += f"{key}={value}; "
+                else:
+                    second_p_id = True
+            else:
+                return_value += f"{key}={value}; "
+                
+    return_value += "att=1-ALdRXHcPCiwMHTkYgiLn9igJxkFYoQRhFeS8BlI9; "
 
-async def update_guest_token(
-    bearer_token: str,
-    cookie_jar: CookieJar,
-) -> str:
-    """
-    Calls Twitter's guest activation endpoint to acquire a new guest token.
-    - `bearer_token`: The "App" Bearer token used for authentication (from dev portal).
-    - `cookie_jar`: A CookieJar holding any necessary cookies.
-
-    Returns:
-        The new guest_token as a string.
-
-    Raises:
-        RuntimeError if the request fails or no guest_token is found.
-    """
-
-    guest_activate_url = "https://api.twitter.com/1.1/guest/activate.json"
-
-    # Build the 'Cookie' header from the jar, if needed.
-    # This is similar to 'await this.getCookieString()' in TypeScript.
-    # We'll assume you have some helper or do it inline:
-    cookie_str = _get_cookie_string(cookie_jar, "https://api.twitter.com")
-
-    headers = {
-        "Authorization": f"Bearer {bearer_token}",
-        "Cookie": cookie_str,
-    }
-
-    # Create a session to POST
-    async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
-        async with session.post(guest_activate_url, headers=headers) as res:
-            # In TypeScript you had `res.ok` and `res.text()`.
-            # In aiohttp, we check status != 200:
-            if res.status != 200:
-                err_text = await res.text()
-                raise RuntimeError(f"Failed to activate guest => {res.status}: {err_text}")
-
-            # The body should have JSON with 'guest_token'.
-            data = await res.json()
-            if not data or "guest_token" not in data:
-                raise RuntimeError("guest_token not found in response.")
-
-            guest_token = data["guest_token"]
-            if not isinstance(guest_token, str):
-                raise RuntimeError("guest_token was not a string.")
-
-            # If desired, we can manually parse 'Set-Cookie' from res.headers,
-            # but since we pass the same session + jar, aiohttp handles it automatically.
-
-            return guest_token
-
-
-def _get_cookie_string(cookie_jar: CookieJar, domain_url: str) -> str:
-    """
-    Reconstruct the Cookie header string from the cookie jar for a given domain.
-    This is an internal helper method, analogous to the TypeScript getCookieString().
-    """
-    cookies = cookie_jar.filter_cookies(domain_url)
-    return "; ".join(f"{k}={v.value}" for k, v in cookies.items())
+    return return_value[:-2]

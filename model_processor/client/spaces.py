@@ -4,30 +4,13 @@ import logging
 import time
 import aiohttp
 from typing import Optional, Dict, Any, Set, List
+from tweeterpy import TweeterPy
 
 from chat_client import ChatClient
-from custom_janus_client import JanusClient
-from authenticator import TwitterAuth, get_periscope_cookie
+from custom_janus_client import JanusClient, EventEmitter, JanusConfig
+from authenticator import get_periscope_cookie, generate_random_id
 
 logger = logging.getLogger(__name__)
-
-
-class EventEmitter:
-    """
-    Minimal Python equivalent of Node's EventEmitter.
-    """
-    def __init__(self):
-        self._listeners = {}
-
-    def on(self, event_name, callback):
-        if event_name not in self._listeners:
-            self._listeners[event_name] = []
-        self._listeners[event_name].append(callback)
-
-    def emit(self, event_name, *args, **kwargs):
-        if event_name in self._listeners:
-            for callback in self._listeners[event_name]:
-                callback(*args, **kwargs)
 
 
 # ----- Example type hints, similar to your TypeScript interfaces -----
@@ -118,10 +101,11 @@ async def authorize_token(cookie: str) -> str:
     Python equivalent of authorizeToken(cookie: string): Promise<string>.
     Calls https://proxsee.pscp.tv/api/v2/authorizeToken and returns authorization_token.
     """
+    idempotence = generate_random_id()
     headers = {
         "X-Periscope-User-Agent": "Twitter/m5",
         "Content-Type": "application/json",
-        "X-Idempotence": str(int(time.time() * 1000)),  # approximate to Date.now()
+        "X-Idempotence": idempotence,
         "Referer": "https://x.com/",
         "X-Attempt": "1",
     }
@@ -157,11 +141,12 @@ async def publish_broadcast(
     Python equivalent of publishBroadcast(...).
     Calls https://proxsee.pscp.tv/api/v2/publishBroadcast to finalize the broadcast config.
     """
+    idempotence = generate_random_id()
     headers = {
         "X-Periscope-User-Agent": "Twitter/m5",
         "Content-Type": "application/json",
         "Referer": "https://x.com/",
-        "X-Idempotence": str(int(time.time() * 1000)),
+        "X-Idempotence": idempotence,
         "X-Attempt": "1",
     }
 
@@ -192,11 +177,12 @@ async def get_turn_servers(cookie: str) -> Dict[str, Any]:  # or TurnServersInfo
     Python equivalent of getTurnServers(cookie: string).
     POSTs to https://proxsee.pscp.tv/api/v2/turnServers and returns the JSON response.
     """
+    idempotence = generate_random_id()
     headers = {
         "X-Periscope-User-Agent": "Twitter/m5",
         "Content-Type": "application/json",
         "Referer": "https://x.com/",
-        "X-Idempotence": str(int(time.time() * 1000)),
+        "X-Idempotence": idempotence,
         "X-Attempt": "1",
     }
 
@@ -240,16 +226,17 @@ async def create_broadcast(
     languages: Optional[list],
     cookie: str,
     region: str
-) -> Dict[str, Any]:  # or BroadcastCreated
+) -> Dict[str, Any]:
     """
     Python equivalent of createBroadcast(...).
     Creates a new broadcast via https://proxsee.pscp.tv/api/v2/createBroadcast
     and returns the JSON response.
     """
+    idempotence = generate_random_id()
     headers = {
         "X-Periscope-User-Agent": "Twitter/m5",
         "Content-Type": "application/json",
-        "X-Idempotence": str(int(time.time() * 1000)),
+        "X-Idempotence": idempotence,
         "Referer": "https://x.com/",
         "X-Attempt": "1",
     }
@@ -291,7 +278,7 @@ class Space(EventEmitter):
     3) Approve speakers, push audio, etc.
     """
 
-    def __init__(self, twitter_auth: TwitterAuth):
+    def __init__(self, twitter_auth: TweeterPy):
         super().__init__()
 
         self.auth = twitter_auth
@@ -334,12 +321,12 @@ class Space(EventEmitter):
 
         # 3) create broadcast
         logger.info("[Space] Creating broadcast...")
-        broadcast = await create_broadcast({
-            "description": config.description,
-            "languages": config.languages,
-            "cookie": cookie,
-            "region": region,
-        })
+        broadcast = await create_broadcast(
+            description=config.description,
+            languages=config.languages,
+            cookie=cookie,
+            region=region,
+        )
         self.broadcast_info = broadcast
 
         # 4) Authorize token if needed
@@ -351,14 +338,15 @@ class Space(EventEmitter):
         turn_servers: TurnServersInfo = await get_turn_servers(cookie)
 
         # 6) Create Janus client
-        self.janus_client = JanusClient({
-            "webrtcUrl": broadcast.webrtc_gw_url,
-            "roomId": broadcast.room_id,
-            "credential": broadcast.credential,
-            "userId": broadcast.broadcast["user_id"],
-            "streamName": broadcast.stream_name,
-            "turnServers": turn_servers,
-        })
+        janus_config = JanusConfig(
+            webrtc_url=broadcast["webrtc_gw_url"],
+            room_id=broadcast["room_id"],
+            credential=broadcast["credential"],
+            user_id=broadcast["broadcast"]["user_id"],
+            stream_name=broadcast["stream_name"],
+            turn_servers=turn_servers,
+        )
+        self.janus_client = JanusClient(config=janus_config)
 
         # Listen for incoming audio from Janus
         self.janus_client.on("audioDataFromSpeaker", self._handle_audio_data)

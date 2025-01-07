@@ -8,7 +8,6 @@ import time
 from tweeterpy import TweeterPy
 
 from spaces import Space, SpaceConfig
-from authenticator import TwitterAuth
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,19 +32,12 @@ def generate_beep(sample_rate=48000, duration=0.2, frequency=440.0, amplitude=10
 
 async def main():
     # Replace these with real tokens or credentials
-    bearer_token = os.getenv("BEARER_TOKEN", "YOUR_BEARER_TOKEN")
-    
     email, username, password = os.getenv("TWITTER_EMAIL"), os.getenv("TWITTER_USERNAME"), os.getenv("TWITTER_PASSWORD")
     twitter = TweeterPy()
     twitter.login(username=username, password=password, email=email)
 
-    # You start with no guest token
-    auth = TwitterAuth(bearer_token=bearer_token, guest_token=twitter.session.cookies.get("gt"))
-
-    print("Got guest token:", auth.guest_token)
-
     # Create the Space instance
-    space = Space(twitter_auth=auth)
+    space = Space(twitter)
 
     # Create a config
     config = SpaceConfig(

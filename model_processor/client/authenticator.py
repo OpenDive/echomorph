@@ -15,9 +15,6 @@ def generate_random_id() -> str:
     return str(uuid.uuid4())
 
 
-# ---------------------------------------------------------------------------
-# Existing Periscope authentication flow
-# ---------------------------------------------------------------------------
 async def fetch_authenticate_periscope(scraper: TweeterPy) -> str:
     """
     Equivalent to TypeScript's 'fetchAuthenticatePeriscope(auth)'.

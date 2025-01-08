@@ -54,6 +54,7 @@ echomorph/
 |   ├── rvc/             # Contains scripts used for inferencing the RVC model
 |   └── voice_node/      # Combines the above to act as the front facing voice node
 └──
+```
 
 - **`janus_client.py`, `custom_janus_client.py`**  
   Handles Janus WebRTC session creation, media handling, and plugin attachment.
@@ -72,7 +73,6 @@ echomorph/
 
 - **`test_space.py`**  
   Demonstrates how to use the library to create a Space, play a test beep, and stop gracefully after some time.
-```
 
 ### Usage
 

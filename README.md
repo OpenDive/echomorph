@@ -126,8 +126,7 @@ if __name__ == "__main__":
 
 ### License
 
-This project is not officially affiliated with Twitter, Inc. or Twitter’s APIs and is offered “as is” without warranty. Check with Twitter’s Developer Agreement & Policy for usage rules.  
-(You can specify an actual license such as [MIT License](https://opensource.org/licenses/MIT) here, if desired.)
+This project is not officially affiliated with Twitter, Inc. or Twitter’s APIs and is offered “as is” without warranty. Check with Twitter’s Developer Agreement & Policy for usage rules.
 
 ### Disclaimer
 

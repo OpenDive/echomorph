@@ -22,7 +22,7 @@
 
 ### Prerequisites
 
-- A recent version of Python (3.8+ recommended).
+- A recent version of Python (3.11+ recommended).
 - Access to Twitter’s developer API (if you plan on using advanced Twitter functionalities).
 - Familiarity with WebRTC concepts and Janus for audio/video publishing (optional but recommended).
 

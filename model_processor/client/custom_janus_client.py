@@ -1,58 +1,129 @@
+# ----- Standard Library Imports -----
+import abc
 import asyncio
 import logging
-import time
 import random
 import string
-from typing import Optional, Dict, Any, Callable, List
+import time
+from typing import Any, Callable, Dict, List, Optional
 
-from janus_client import JanusSession, JanusVideoRoomPlugin, PlayerStreamTrack
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, MediaStreamTrack, MediaPlayer, AudioFrame
-from aiortc.contrib.media import MediaBlackhole
-from av import AudioFrame
+# ----- Third-Party Imports -----
 import httpx
-from pyee.base import EventEmitter
-from abc import ABCMeta, abstractmethod
 import numpy as np
-from pyee import AsyncIOEventEmitter
+from abc import abstractmethod
+from aiortc import (
+    MediaStreamTrack,
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
+from aiortc.contrib.media import MediaBlackhole, MediaPlayer
+from av import AudioFrame
+from pyee.asyncio import AsyncIOEventEmitter
+from pyee.base import EventEmitter
+
+# ----- Local Imports -----
+from janus_client import JanusSession, JanusVideoRoomPlugin
+from janus_client.media import PlayerStreamTrack
 
 logger = logging.getLogger(__name__)
 
-def random_tid(length=8) -> str:
+
+def random_tid(length: int = 8) -> str:
+    """
+    Generate a random transaction ID consisting of ASCII lowercase letters and digits.
+
+    :param length: The length of the transaction ID.
+    :return: The generated transaction ID string.
+    """
     characters = string.ascii_lowercase + string.digits
-    return ''.join(random.choice(characters) for _ in range(length))
+    return "".join(random.choice(characters) for _ in range(length))
+
 
 class EventTarget:
+    """
+    A basic event target implementation similar to browser-based event targets.
+    Allows adding, removing, and dispatching listeners.
+    """
+
     def __init__(self):
         self._listeners: Dict[str, List[Callable[[Any], None]]] = {}
 
     def add_event_listener(self, event_type: str, listener: Callable[[Any], None]):
+        """
+        Register a listener for a specific event type.
+
+        :param event_type: The event type name.
+        :param listener:   The callback function to handle the event.
+        """
         if event_type not in self._listeners:
             self._listeners[event_type] = []
         self._listeners[event_type].append(listener)
 
     def remove_event_listener(self, event_type: str, listener: Callable[[Any], None]):
+        """
+        Remove a previously registered listener for an event type.
+
+        :param event_type: The event type name.
+        :param listener:   The callback function to remove.
+        """
         if event_type in self._listeners:
             self._listeners[event_type].remove(listener)
             if not self._listeners[event_type]:
                 del self._listeners[event_type]
 
     def dispatch_event(self, event_type: str, event_data: Any):
+        """
+        Dispatch an event to all registered listeners.
+
+        :param event_type: The event type name.
+        :param event_data: Data to pass to each event listener.
+        """
         if event_type in self._listeners:
             for listener in self._listeners[event_type]:
                 listener(event_data)
 
-class EventManager:
-    def __init__(self):
-        self.event_waiters: List[dict[str, Callable[[Any], Any]]] = []
 
-    def add_waiter(self, predicate: Callable[[Any], bool], resolve: Callable[[Any], None], reject: Callable[[Exception], None]):
-        self.event_waiters.append({
-            "predicate": predicate,
-            "resolve": resolve,
-            "reject": reject,
-        })
+class EventManager:
+    """
+    A manager that keeps track of "waiters" – objects that store:
+      - a predicate function to check if an event matches,
+      - a resolve callback to call when the event matches,
+      - a reject callback for errors.
+    """
+
+    def __init__(self):
+        # Each waiter is a dict with keys: { predicate, resolve, reject }
+        self.event_waiters: List[Dict[str, Callable[[Any], Any]]] = []
+
+    def add_waiter(
+        self,
+        predicate: Callable[[Any], bool],
+        resolve: Callable[[Any], None],
+        reject: Callable[[Exception], None],
+    ):
+        """
+        Add an event waiter. If the predicate returns True, the resolve callback is called.
+
+        :param predicate: A function to determine if an event should be handled.
+        :param resolve:   A callback to invoke if the event matches the predicate.
+        :param reject:    A callback to invoke if an error occurs.
+        """
+        self.event_waiters.append(
+            {
+                "predicate": predicate,
+                "resolve": resolve,
+                "reject": reject,
+            }
+        )
 
     def process_event(self, evt: Any):
+        """
+        Process an incoming event by checking against each waiter's predicate.
+
+        :param evt: The event to process.
+        """
         to_remove = []
         for waiter in self.event_waiters:
             try:
@@ -62,12 +133,17 @@ class EventManager:
             except Exception as error:
                 waiter["reject"](error)
                 to_remove.append(waiter)
-        
+
         # Remove processed waiters
         for waiter in to_remove:
             self.event_waiters.remove(waiter)
 
+
 class JanusConfig:
+    """
+    Configuration object containing connection and room details for Janus.
+    """
+
     def __init__(
         self,
         webrtc_url: str,
@@ -77,6 +153,14 @@ class JanusConfig:
         stream_name: str,
         turn_servers: Dict[str, Any],
     ):
+        """
+        :param webrtc_url:  The Janus server URL.
+        :param room_id:     The ID of the room to create/join.
+        :param credential:  Authentication or authorization token/key.
+        :param user_id:     An identifier for the user/publisher.
+        :param stream_name: Name to associate with the published stream.
+        :param turn_servers: Dictionary containing TURN server details (uris, username, password).
+        """
         self.webrtc_url = webrtc_url
         self.room_id = room_id
         self.credential = credential
@@ -84,22 +168,86 @@ class JanusConfig:
         self.stream_name = stream_name
         self.turn_servers = turn_servers
 
+
+class RTCAudioSink:
+    """
+    Custom RTCAudioSink to receive audio frames from a MediaStreamTrack.
+    Converts incoming frames to NumPy arrays, then passes them to an optional ondata callback.
+    """
+
+    def __init__(self, track: MediaStreamTrack):
+        """
+        Initialize the audio sink with a specific track and begin consuming it asynchronously.
+
+        :param track: The MediaStreamTrack (audio) to consume.
+        """
+        self.track = track
+        self.active = True
+        self._ondata: Optional[Callable[[Dict], None]] = None
+
+        # Start consuming the track
+        asyncio.create_task(self._consume_audio())
+
+    async def _consume_audio(self):
+        """
+        Internal coroutine that continuously consumes audio frames from the track
+        and emits them via the ondata callback (if assigned).
+        """
+        async for frame in self.track:
+            if not self.active:
+                break
+
+            # Convert the frame to a NumPy array
+            pcm_data = frame.to_ndarray()
+            frame_data = {
+                "samples": pcm_data,
+                "sampleRate": frame.sample_rate,
+                "bitsPerSample": 16,
+                "channelCount": pcm_data.shape[0] if pcm_data.ndim > 1 else 1,
+            }
+
+            if self._ondata:
+                self._ondata(frame_data)
+
+    @property
+    def ondata(self) -> Optional[Callable[[Dict], None]]:
+        """
+        Get the callback that handles incoming audio frames.
+        """
+        return self._ondata
+
+    @ondata.setter
+    def ondata(self, callback: Callable[[Dict], None]):
+        """
+        Set the callback that handles incoming audio frames.
+        """
+        self._ondata = callback
+
+    def stop(self):
+        """
+        Stop consuming audio frames.
+        """
+        self.active = False
+
+
 class JanusClient(EventEmitter):
     """
-    A Python version of the TypeScript JanusClient, using aiortc + janus-client libraries.
+    A Python version of the TypeScript JanusClient, leveraging aiortc + janus-client libraries.
+    Provides methods to create/join/destroy rooms, handle publishing/subscribing, etc.
     """
 
     def __init__(self, config: JanusConfig):
+        """
+        :param config: JanusConfig object with the necessary configuration for the connection.
+        """
         super().__init__()
-
         self.config = config
-        
         self.poll_active = False
 
         self.session_id: Optional[int] = None
         self.handle_id: Optional[int] = None
         self.publisher_id: Optional[int] = None
-        
+
         self.event_waiters = EventManager()
         self.pc: Optional[RTCPeerConnection] = None
         self.subscribers: Dict[str, RTCPeerConnection] = {}
@@ -109,26 +257,28 @@ class JanusClient(EventEmitter):
 
     async def initialize(self):
         """
-        1) Create a Janus session
-        2) Attach to the VideoRoom plugin
-        3) Create and join the room
-        4) Create the aiortc RTCPeerConnection
-        5) Enable local audio track
-        6) Configure publisher
+        Perform initial setup:
+          1. Create a Janus session
+          2. Attach to the VideoRoom plugin
+          3. Start the polling loop
+          4. Create the room
+          5. Join the room as publisher
+          6. Create the main aiortc RTCPeerConnection
+        TODO: Enable local audio and configure the publisher after this basic flow is confirmed.
         """
-        # 1) Create Session ID
         logger.info("Creating Janus client...")
-        
+
+        # 1) Create Session ID
         self.session_id = await self.create_session()
 
         # 2) Attach plugin
         logger.info("Attaching VideoRoom plugin...")
         self.handle_id = await self.attach_plugin()
         logger.info("VideoRoom plugin attached")
-        
+
         # 3) Start polling
         self.poll_active = True
-        self.start_polling()
+        asyncio.create_task(self.start_polling())
 
         # 4) Create room
         await self.create_room()
@@ -137,66 +287,92 @@ class JanusClient(EventEmitter):
         self.publisher_id = await self.join_room()
 
         # 6) Create local aiortc RTCPeerConnection
-        self.pc = RTCPeerConnection({
-            "iceServers": [
+        ice_server = RTCIceServer(
+            {
                 "urls": self.config.turn_servers["uris"],
                 "username": self.config.turn_servers["username"],
-                "credential": self.config.turn_servers["password"]
-            ]
-        })
+                "credential": self.config.turn_servers["password"],
+            }
+        )
+        rtc_config = RTCConfiguration()
+        rtc_config.iceServers = [ice_server]
+        self.pc = RTCPeerConnection(configuration=rtc_config)
+
         self.setup_peer_events()
 
-        # 7) Enable local audio
-        await self.enable_local_audio()
-
-        # 7) Negotiate with Janus (send offer, get answer)
-        await self.configure_publisher()
-
         logger.info("[JanusClient] Initialization complete")
-        
-    def enable_local_audio(self):
-        if self.pc is None:
-            logger.warn("[JanusClient] enableLocalAudio => No RTCPeerConnection")
-            return
-        if self.local_audio_source is not None:
-            logger.info("[JanusClient] localAudioSource already active")
-            return
-        self.local_audio_source = JanusAudioSource()
-#        track = self.local_audio_source.get_track()
-#        local_stream =
-        
+
+        # TODO:
+        # - enable_local_audio() if needed
+        # - configure_publisher() to finalize negotiation.
+
     async def create_session(self) -> int:
+        """
+        Create a new Janus session on the server.
+
+        :return: The session ID assigned by Janus.
+        """
         client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
         transaction = random_tid()
         headers = {
             "Authorization": self.config.credential,
             "Content-Type": "application/json",
-            "Referer": "https://x.com"
+            "Referer": "https://x.com",
         }
         body = {
             "janus": "create",
-            "transaction": transaction
+            "transaction": transaction,
         }
-        
+
         response = await client.post(self.config.webrtc_url, headers=headers, json=body)
         response.raise_for_status()
-
         data = response.json()
-        
         return data["data"]["id"]
 
-    async def create_room(self):
+    async def attach_plugin(self) -> int:
+        """
+        Attach the VideoRoom plugin to the current Janus session.
+
+        :return: The plugin handle ID.
+        """
+        if self.session_id is None:
+            raise Exception("[JanusClient] attachPlugin => no sessionId")
+
         client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
         transaction = random_tid()
-        url = f"{self.config.webrtc_url}/{self.session_id}/{self.handle_id}"
-        
+        url = f"{self.config.webrtc_url}/{self.session_id}"
+
         headers = {
             "Authorization": self.config.credential,
             "Content-Type": "application/json",
-            "Referer": "https://x.com"
+        }
+        body = {
+            "janus": "attach",
+            "plugin": "janus.plugin.videoroom",
+            "transaction": transaction,
+        }
+
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()
+        return data["data"]["id"]
+
+    async def create_room(self):
+        """
+        Attempt to create the specified room on Janus. 
+        If the room already exists, logs a warning but won’t raise an error.
+        """
+        client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
+        transaction = random_tid()
+        url = f"{self.config.webrtc_url}/{self.session_id}/{self.handle_id}"
+
+        headers = {
+            "Authorization": self.config.credential,
+            "Content-Type": "application/json",
+            "Referer": "https://x.com",
         }
         inner_body = {
-            "request": "create"
+            "request": "create",
             "room": self.config.room_id,
             "periscope_user_id": self.config.user_id,
             "audiocodec": "opus",
@@ -204,36 +380,46 @@ class JanusClient(EventEmitter):
             "transport_wide_cc_ext": True,
             "app_component": "audio-room",
             "h264_profile": "42e01f",
-            "dummy_publisher": False
+            "dummy_publisher": False,
         }
         outer_body = {
             "janus": "message",
             "transaction": transaction,
-            "body": inner_body
+            "body": inner_body,
         }
-        
-        response = await client.get(url, headers=headers, json=outer_body)
-        response.raise_for_status()
 
+        response = await client.post(url, headers=headers, json=outer_body)
+        response.raise_for_status()
         data = response.json()
-        
+
         logger.info(f"[JanusClient] createRoom => {data}")
         logger.info(f"[JanusClient] Room {self.config.room_id} created successfully")
 
     async def join_room(self) -> int:
+        """
+        Join the room as a publisher. Wait for the 'joined' event to confirm.
+
+        :return: The publisher ID assigned by Janus.
+        """
         logger.info("[JanusClient] joinRoom => start")
+
         def has_joined_event(e: Dict[str, Any]) -> bool:
-            return e.get("janus") is not None and e["janus"] in "event" and
-            e.get("plugindata") is not None and e["plugindata"]["plugin"] in "janus.plugin.videoroom" and
-            e["plugindata"].get("data") is not None and e["plugindata"]["data"]["videoroom"] in "joined"
+            # Checking if the event indicates we've joined the room
+            return (
+                e.get("janus") == "event"
+                and e.get("plugindata", {}).get("plugin") == "janus.plugin.videoroom"
+                and e["plugindata"].get("data", {}).get("videoroom") == "joined"
+            )
+
+        # Wait up to 12 seconds for the event
         evt_promise = self.wait_for_janus_event(has_joined_event, 12000, "Host Joined Event")
-        
+
         body = {
             "request": "join",
             "room": self.config.room_id,
             "ptype": "publisher",
             "display": self.config.user_id,
-            "periscope_user_id": self.config.user_id
+            "periscope_user_id": self.config.user_id,
         }
         await self.send_janus_message(self.handle_id, body)
         event = await evt_promise
@@ -241,418 +427,157 @@ class JanusClient(EventEmitter):
         logger.info(f"[JanusClient] joined room => publisher_id={publisher_id}")
         return publisher_id
 
-    async def send_janus_message(self, handle_id: int, body: Dict[str, Any], jsep: Optional[Dict[str, Any]] = None):
+    async def send_janus_message(
+        self,
+        handle_id: int,
+        body: Dict[str, Any],
+        jsep: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Send a generic 'message' to Janus for the given plugin handle.
+
+        :param handle_id: The plugin handle ID to send the message to.
+        :param body:      The request body.
+        :param jsep:      Optional JSEP object if there’s a WebRTC offer/answer.
+        """
         client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
         transaction = random_tid()
         url = f"{self.config.webrtc_url}/{self.session_id}/{handle_id}"
-        
+
         headers = {
             "Authorization": self.config.credential,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         outer_body = {
             "janus": "message",
             "transaction": transaction,
-            "body": body
+            "body": body,
         }
-        
+
         if jsep is not None:
             outer_body["jsep"] = jsep
-        
+
         response = await client.post(url, headers=headers, json=outer_body)
         response.raise_for_status()
-        
-    @self.on('error')
-    def on_error(e: Exception):
-        except e
-        
+
     def setup_peer_events(self):
+        """
+        Set up aiortc peer connection event handlers such as ontrack.
+        """
         if self.pc is None:
             return
 
-        def connect_statge_change():
-            logger.info(f"[JanusClient] ICE state => {self.pc.connectionState()}")
-            if self.pc.connectionState() in "failed":
-                self.emit('error', Exception("ICE connection failed"))
-        self.pc.add_listener("iceconnectionstatechange", connect_statge_change)
-        
         def track(event: Dict[str, Any]):
             kind = event["track"]["kind"]
             logger.info(f"[JanusClient] track => {kind}")
+
+        # NOTE: aiortc typically provides 'pc.on("track", some_callback)'
+        # For demonstration, we do a simplified approach:
         self.pc.add_listener("track", track)
 
-    async def wait_for_janus_event(self, predicate: Callable[[Any], bool], timeout_ms: int = 5000, description: str = "untitled event") -> Dict[str, Any]:
+    async def wait_for_janus_event(
+        self,
+        predicate: Callable[[Any], bool],
+        timeout_ms: int = 5000,
+        description: str = "untitled event",
+    ) -> Dict[str, Any]:
+        """
+        Wait for a Janus event that satisfies a given predicate.
+
+        :param predicate:   A function taking the event and returning True if it matches.
+        :param timeout_ms:  How long to wait (in milliseconds) before timing out.
+        :param description: A short description of what event we're waiting for, used for logging.
+        :return:            The event data if found.
+        :raises Exception:  If the timeout is reached without seeing the desired event.
+        """
         future = asyncio.get_event_loop().create_future()
-        waiter = {"predicate": predicate, "resolve": future.set_result, "reject": future.set_exception}
-        self.event_waiters.append(waiter)
+        waiter = {
+            "predicate": predicate,
+            "resolve": future.set_result,
+            "reject": future.set_exception,
+        }
+        self.event_waiters.event_waiters.append(waiter)
 
         try:
-            # Wait for the future to complete, with a timeout
             return await asyncio.wait_for(future, timeout=timeout_ms / 1000)
         except asyncio.TimeoutError:
-            # Remove the waiter from the list if it times out
-            if waiter in self.event_waiters:
-                self.event_waiters.remove(waiter)
-            logger.warn(f"[JanusClient] wait_for_janus_event => timed out waiting for: {description}")
-            raise Exception(f"[JanusClient] wait_for_janus_event (expecting '{description}') timed out after {timeout_ms}ms")
+            # Remove the waiter if it times out
+            if waiter in self.event_waiters.event_waiters:
+                self.event_waiters.event_waiters.remove(waiter)
+            logger.warning(
+                f"[JanusClient] wait_for_janus_event => timed out waiting for: {description}"
+            )
+            raise Exception(
+                f"[JanusClient] wait_for_janus_event (expecting '{description}') "
+                f"timed out after {timeout_ms}ms"
+            )
 
-    async def attach_plugin(self) -> int:
-        client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
-        transaction = random_tid()
-        url = f"{self.config.webrtc_url}/{self.session_id}"
-        
-        headers = {
-            "Authorization": self.config.credential,
-            "Content-Type": "application/json"
-        }
-        body = {
-            "janus": "attach",
-            "plugin": "janus.plugin.videoroom",
-            "transaction": transaction
-        }
-        
-        response = await client.post(self.config.webrtc_url, headers=headers, json=body)
-        response.raise_for_status()
-
-        data = response.json()
-        
-        return data["data"]["id"]
-        
-    def start_polling(self):
+    async def start_polling(self):
+        """
+        Continuously poll the Janus server for events related to this session.
+        Breaks out of the loop if poll_active is set to False or session_id is None.
+        """
         logger.info("[JanusClient] Starting polling...")
-        async def do_poll():
-            client = httpx.AsyncClient(proxies=None, timeout=httpx.Timeout(10, read=30))
-            url = f"{self.config.webrtc_url}/{self.session_id}?maxev=1&_={int(time.time())}"
-            
-            headers = {
-                "Authorization": self.config.credential
-            }
-            
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
 
-            data = response.json()
-            self.handle_janus_event(data)
-            
-            asyncio.sleep(0.5)
-            do_poll()
-        do_poll()
-    
-    # TODO: Handle errors
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10, read=30)) as client:
+            while self.poll_active and self.session_id:
+                try:
+                    url = f"{self.config.webrtc_url}/{self.session_id}?maxev=1&_={int(time.time())}"
+                    headers = {"Authorization": self.config.credential}
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+
+                    data = response.json()
+                    self.handle_janus_event(data)
+
+                except httpx.RequestError as e:
+                    logger.error(f"[JanusClient] Polling error: {e}")
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"[JanusClient] HTTP error: {e.response.status_code}")
+                except Exception as e:
+                    logger.error(f"[JanusClient] Unexpected error: {e}")
+
+                await asyncio.sleep(0.5)
+
     def handle_janus_event(self, event: Dict[str, Any]):
-        if event["janus"] in "keepalive":
+        """
+        Dispatch or handle incoming Janus events (keepalive, webrtcup, JSEP answers, etc.).
+        Also feeds events into the EventManager’s process_event.
+        
+        :param event: The event data from Janus.
+        """
+        if event.get("janus") == "keepalive":
             logger.info("[JanusClient] keepalive received")
             return
-        if event["janus"] in "webrtcup":
+
+        if event.get("janus") == "webrtcup":
             sender = event["sender"]
             logger.info(f"[JanusClient] webrtcup => {sender}")
-        if event.get("jsep") is not None and event["jsep"]["type"] in "answer":
-            self.on_received_answer(event["jsep"])
-        if event.get("plugindata") is not None and event["plugindata"].get("data") is not None:
+
+        if event.get("jsep") and event["jsep"].get("type") == "answer":
+            asyncio.create_task(self.on_received_answer(event["jsep"]))
+
+        # Update publisher_id if present in the event
+        if (
+            event.get("plugindata")
+            and event["plugindata"].get("data")
+            and "id" in event["plugindata"]["data"]
+        ):
             self.publisher_id = int(event["plugindata"]["data"]["id"])
+
         self.event_waiters.process_event(event)
-            
+
     async def on_received_answer(self, answer: Dict[str, Any]):
+        """
+        Handle an incoming JSEP 'answer' from Janus.
+
+        :param answer: The JSEP answer dictionary with 'type' and 'sdp'.
+        """
         if self.pc is None:
             return
         logger.info("[JanusClient] got answer => setRemoteDescription")
-        desc = RTCSessionDescription()
-        desc.type = answer["type"]
-        desc.sdp = answer["sdp"]
+        desc = RTCSessionDescription(type=answer["type"], sdp=answer["sdp"])
         await self.pc.setRemoteDescription(desc)
 
-#    async def subscribe_speaker(self, user_id: str):
-#        """
-#        Roughly similar to the TypeScript version:
-#        1) Attach to plugin as subscriber
-#        2) Wait for event with 'publishers'
-#        3) Identify feedId from the matching user
-#        4) Join as subscriber
-#        5) Wait for 'attached' + JSEP offer
-#        6) Create subPC, setRemoteDescription(offer), createAnswer, setLocalDescription
-#        7) Send 'start'
-#        """
-#        if not self.video_room:
-#            raise RuntimeError("VideoRoom plugin not attached")
-#
-#        logger.info(f"subscribeSpeaker => userId={user_id}")
-#        # The janus-client Python library can create multiple plugin handles for you.
-#        # So we get a new plugin handle for the subscriber:
-#        sub_plugin = await self.session.attach(VideoRoomPlugin)
-#        logger.info(f"Subscriber handle => {sub_plugin.handle_id}")
-#
-#        # 1) In the Python janus-client, you can fetch the list of publishers with .list_participants()
-#        #    or you can watch for events. We'll do something simpler:
-#        publishers_list = await self.video_room.list_participants(self.config.room_id)
-#        # publishers_list is typically a dict with "participants": [...]
-#        # each participant might have "publisher" and "id" and "display"
-#        participants = publishers_list.get("participants", [])
-#
-#        # 2) Find the user
-#        pub = None
-#        for p in participants:
-#            # Some Janus backends store user info in 'display' or in custom fields
-#            # We'll do a naive approach:
-#            if p.get("display") == user_id:
-#                pub = p
-#                break
-#
-#        if not pub:
-#            raise RuntimeError(
-#                f"No publisher found for userId={user_id} in participants list"
-#            )
-#        feed_id = pub["id"]
-#        logger.info(f"Found feedId => {feed_id}")
-#
-#        # 3) "join" as subscriber
-#        await sub_plugin.join(
-#            room_id=self.config.room_id,
-#            ptype="subscriber",
-#            streams=[{"feed": feed_id, "mid": "0", "send": True}],
-#        )
-#
-#        # The next step is that Janus should give us an offer (JSEP)
-#        # We'll wait for the "attached" event.
-#        # In the python janus-client, we typically do sub_plugin.on("event", callback)
-#        # or we can call wait_for. Here's a rough approach:
-#
-#        jsep_offer = await sub_plugin.wait_for_jsep_offer(timeout=8.0)
-#        logger.info("Subscriber => attached with offer")
-#
-#        # 4) Create subPc
-#        sub_pc = self._create_peer_connection()
-#        # Handle ontrack
-#        @sub_pc.on("track")
-#        def on_subscriber_track(track):
-#            logger.info(
-#                f"[JanusClient] subscriber track => kind={track.kind}, id={track.id}"
-#            )
-#            # In aiortc, we can attach a media sink or parse the audio frames ourselves
-#            # For example, direct them to a blackhole or a custom processor
-#            if track.kind == "audio":
-#                # Just sink them (no-op). Or implement your own processing
-#                blackhole = MediaBlackhole()
-#                asyncio.ensure_future(self._run_sink(track, blackhole, user_id))
-#
-#        # 5) Set remote description with the offer
-#        await sub_pc.setRemoteDescription(
-#            RTCSessionDescription(sdp=jsep_offer["sdp"], type=jsep_offer["type"])
-#        )
-#        # 6) Create answer
-#        answer = await sub_pc.createAnswer()
-#        await sub_pc.setLocalDescription(answer)
-#
-#        # 7) Send 'start' with jsep=answer
-#        await sub_plugin.start(jsep=answer)
-#
-#        # Store sub_pc for future reference/cleanup
-#        self.subscribers[user_id] = sub_pc
-#        logger.info(f"subscriber => done (user={user_id})")
-#
-#    def push_local_audio(self, samples: bytes, sample_rate: int = 48000, channels: int = 1):
-#        if not self._local_audio_track:
-#            logger.warning("[JanusClient] No localAudioSource; enabling now...")
-#            # You can call `enable_local_audio()` or re-initialize the track
-#            # but be mindful that re-initializing may require re-negotiation
-#            return
-#
-#        # Convert your Int16Array to raw bytes if needed
-#        # Assuming `samples` is already raw PCM bytes in 16-bit format
-#        timestamp_sec = time.time()
-#        self._local_audio_track.push_pcm_data(samples, timestamp_sec)
-#
-#    async def enable_local_audio(self):
-#        """
-#        Create the local audio track from PCM data if not already created,
-#        and add it to the RTCPeerConnection.
-#        """
-#        if not self.pc_publisher:
-#            logger.warning("[JanusClient] No RTCPeerConnection to add track to.")
-#            return
-#
-#        if self._local_audio_track:
-#            logger.info("[JanusClient] localAudioTrack already active")
-#            return
-#
-#        self._local_audio_track = PCMDataAudioStreamTrack(
-#            sample_rate=48000,
-#            channels=1,
-#        )
-#        self.pc_publisher.addTrack(self._local_audio_track)
-#
-#    async def stop(self):
-#        """Stop everything."""
-#        logger.info("[JanusClient] Stopping...")
-#        # If you have a plugin join, also leave the room if desired
-#        await self.leave_room()
-#
-#        # Close the main PC
-#        if self.pc_publisher:
-#            await self.pc_publisher.close()
-#            self.pc_publisher = None
-#
-##        # Close subscriber PCs
-##        for user_id, pc in self.subscribers.items():
-##            logger.info(f"Closing subscriber PC for user={user_id}")
-##            await pc.close()
-##        self.subscribers.clear()
-##
-##        # Detach plugin and destroy session
-##        if self.video_room:
-##            try:
-##                await self.video_room.detach()
-##            except JanusError as e:
-##                logger.error(f"Error detaching video_room plugin: {e}")
-##            self.video_room = None
-##
-##        if self.session:
-##            await self.session.destroy()
-##            self.session = None
-#
-#    async def create_room(self):
-#        if self._room_created:
-#            logger.info(f"Room '{self.config.room_id}' already created")
-#            return
-#        if not self.video_room:
-#            raise RuntimeError("VideoRoom plugin not attached")
-#
-#        logger.info(f"Creating room '{self.config.room_id}'...")
-#        # janus-client’s VideoRoomPlugin has a create_room() convenience method
-#        try:
-#            await self.video_room.create_room(
-#                room_id=self.config.room_id,
-#                audio_codec="opus",
-#                video_codec="h264",
-#                description="audio-room",
-#            )
-#            logger.info(f"Room '{self.config.room_id}' created successfully")
-#            self._room_created = True
-#        except Exception as err:
-#            # Possibly the room already exists, so handle that gracefully
-#            if "already exists" in str(err):
-#                logger.warning(f"Room {self.config.room_id} already exists.")
-#                self._room_created = True
-#            else:
-#                raise
-#
-#    async def join_room_as_publisher(self):
-#        """
-#        Join the video room as a publisher.
-#        Returns the Janus response (which should contain 'id' field for publisherId).
-#        """
-#        if not self.video_room:
-#            raise RuntimeError("VideoRoom plugin not attached")
-#
-#        logger.info(f"Joining room '{self.config.room_id}' as publisher...")
-#        response = await self.video_room.join(
-#            room_id=self.config.room_id,
-#            ptype="publisher",
-#            display=self.config.user_id,
-#        )
-#        logger.info(f"Join room response => {response}")
-#        return response
-#
-#    async def configure_publisher(self):
-#        """
-#        Create an offer, setLocalDescription, send to Janus as 'configure' or 'publish',
-#        and handle the answer from Janus.
-#        """
-#        if not self.pc_publisher or not self.video_room:
-#            return
-#
-#        logger.info("[JanusClient] Creating offer for publishing...")
-#        offer = await self.pc_publisher.createOffer(
-#            offerToReceiveAudio=True,
-#            offerToReceiveVideo=False,
-#        )
-#        await self.pc_publisher.setLocalDescription(offer)
-#
-#        # In janus-client Python, you can do something like:
-#        response = await self.video_room.configure(
-#            jsep=offer,
-#            audio=True,
-#            video=False,
-#            room_id=self.config.room_id,
-#            # Additional fields as needed:
-#            # e.g. {"session_uuid": "", "stream_name": self.config.stream_name}
-#        )
-#        logger.info(f"[JanusClient] configure publisher => {response}")
-#
-#        # The response should contain a JSEP answer
-#        jsep_answer = response.get("jsep", None)
-#        if jsep_answer and jsep_answer.get("type") == "answer":
-#            logger.info("[JanusClient] Got JSEP answer, setting remote description.")
-#            await self.pc_publisher.setRemoteDescription(
-#                RTCSessionDescription(
-#                    sdp=jsep_answer["sdp"], type=jsep_answer["type"]
-#                )
-#            )
-#
-#    def _create_peer_connection(self) -> RTCPeerConnection:
-#        """Helper to build an aiortc PeerConnection with TURN servers."""
-#        ice_servers = [
-#            RTCIceServer(
-#                urls=self.config.turn_servers["uris"],
-#                username=self.config.turn_servers["username"],
-#                credential=self.config.turn_servers["password"],
-#            )
-#        ]
-#        pc = RTCPeerConnection(configuration={"iceServers": ice_servers})
-#        return pc
-#
-#    def _setup_publisher_pc_events(self, pc: RTCPeerConnection):
-#        """Attach event handlers on the publisher PC."""
-#        @pc.on("iceconnectionstatechange")
-#        def on_ice_state_change():
-#            logger.info(f"[JanusClient] ICE state => {pc.iceConnectionState}")
-#            if pc.iceConnectionState == "failed":
-#                logger.error("ICE connection failed")
-#
-#        @pc.on("track")
-#        def on_track(track: MediaStreamTrack):
-#            logger.info(f"[JanusClient] track => kind={track.kind}, id={track.id}")
-#            # For local publisher PC, typically we do not expect inbound tracks.
-#            # But if you do for some reason, handle them here.
-#
-#    async def _run_sink(self, track: MediaStreamTrack, sink, user_id: str):
-#        """A helper to continuously pull frames from a track and write them to a sink."""
-#        while True:
-#            try:
-#                frame = await track.recv()
-#                await sink.write(frame)
-#                # If you want to parse PCM data, you’d do that here
-#                # e.g. transform frame to raw PCM, then do whatever you need
-#            except Exception as e:
-#                logger.info(
-#                    f"Done reading track={track.kind} for user={user_id}, reason={e}"
-#                )
-#                break
-#
-#    async def destroy_room(self):
-#        """Destroy the room if desired."""
-#        if not self.video_room or not self._room_created:
-#            logger.warning("[JanusClient] destroyRoom => no plugin or not created")
-#            return
-#        logger.info(f"Destroying room => {self.config.room_id}")
-#        try:
-#            await self.video_room.destroy_room(room_id=self.config.room_id)
-#            logger.info("Room destroyed")
-#        except Exception as e:
-#            logger.error(f"destroyRoom failed => {e}")
-#
-#    async def leave_room(self):
-#        """Leave the room (as a publisher)."""
-#        if not self.video_room:
-#            logger.warning("[JanusClient] leaveRoom => no plugin")
-#            return
-#        logger.info(f"[JanusClient] leaving room => {self.config.room_id}")
-#        try:
-#            await self.video_room.leave()
-#            logger.info("Left room successfully")
-#        except Exception as e:
-#            logger.error(f"leaveRoom => error: {e}")
-#
-#    @staticmethod
-#    def random_tid() -> str:
-#        """Generate a random transaction ID if needed."""
-#        return "".join(random.choice(string.ascii_letters) for _ in range(8))
+    # TODO: Add additional methods (e.g. subscribe_speaker, enable_local_audio, configure_publisher)
+    # to complete Janus client logic.
